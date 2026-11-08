@@ -4,6 +4,7 @@ const User = require('../models/User');
 const Student = require('../models/Student');
 const { protect } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
+const { sendMail, template } = require('../utils/mailer');
 
 const sign = (user) =>
   jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
@@ -58,6 +59,13 @@ router.post('/register', asyncHandler(async (req, res) => {
     await User.findByIdAndDelete(user._id);
     throw error;
   }
+  sendMail({
+    to: user.email,
+    subject: 'Welcome to the Campus Placement Portal',
+    text: `Hi ${name}, your account is ready. Complete your profile and upload your resume to start applying.`,
+    html: template(`Welcome, ${name}!`, 'Your account is ready. Complete your profile and upload your resume to start applying for placement drives.'),
+
+  })
 
   res.status(201).json({
     token: sign(user),

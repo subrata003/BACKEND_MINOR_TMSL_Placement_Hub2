@@ -5,6 +5,24 @@ const Application = require('../models/Application');
 const { protect, authorize } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const { checkEligibility } = require('../utils/eligibility');
+const notify = require('../utils/notify');
+
+
+// Notify (in-app + email) every eligible student about a new drive
+async function notifyEligibleStudents(job) {
+  try {
+    if (job.status !== 'Open') return;
+    const students = await Student.find().select('user department degree cgpa percentage backlogs passingYear');
+    for (const s of students) {
+      if (checkEligibility(s, job).eligible) {
+        notify(s.user, 'New placement drive',
+          `${job.company.name} is hiring for ${job.title}. Apply before ${new Date(job.deadline).toDateString()}.`);
+      }
+    }
+  } catch (e) {
+    console.error('notifyEligibleStudents failed:', e.message);
+  }
+}
 
 router.use(protect);
 
@@ -49,7 +67,9 @@ router.get('/:id', asyncHandler(async (req, res) => {
 
 router.post('/', authorize('admin'), asyncHandler(async (req, res) => {
   const job = await Job.create(req.body);
-  res.status(201).json(await job.populate('company', 'name'));
+  const populated = await job.populate('company', 'name');
+  notifyEligibleStudents(populated); // fire-and-forget
+  res.status(201).json(populated);
 }));
 
 router.put('/:id', authorize('admin'), asyncHandler(async (req, res) => {
