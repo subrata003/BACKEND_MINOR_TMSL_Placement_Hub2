@@ -13,10 +13,13 @@ const XLSX = require('xlsx');
 const Application = require('../models/Application');
 const Student = require('../models/Student');
 const Job = require('../models/Job');
+const Interview = require('../models/Interview');
 const { protect, authorize } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const uploadExcel = require('../middleware/uploadExcel');
 const notify = require('../utils/notify');
+const { sendMail, interviewNotificationTemplate } = require('../utils/mailer');
+const User = require('../models/User');
 
 // All bulk routes are admin-only
 router.use(protect, authorize('admin'));
@@ -332,6 +335,145 @@ router.post('/confirm-shortlist', asyncHandler(async (req, res) => {
     message: `Successfully advanced ${result.modifiedCount} student(s) to Round ${nextRound}.`,
     updated: result.modifiedCount,
     nextRound,
+  });
+}));
+
+// ─────────────────────────────────────────────
+// POST /api/bulk/schedule-interviews
+// Body: {
+//   jobId, roundNumber, roundName,
+//   date (ISO string), time (HH:MM),
+//   mode ('Online' | 'Offline'),
+//   meetingLink (if Online), venue (if Offline),
+//   applicationIds: [...] — the apps just advanced
+// }
+// Creates Interview docs for all matched students
+// and sends rich email + in-app notification
+// ─────────────────────────────────────────────
+router.post('/schedule-interviews', asyncHandler(async (req, res) => {
+  const {
+    jobId, roundNumber, roundName,
+    date, time, mode, meetingLink, venue,
+    applicationIds,
+  } = req.body;
+
+  // Validate required fields
+  if (!jobId || !roundNumber || !roundName || !date || !time || !mode) {
+    return res.status(400).json({ message: 'jobId, roundNumber, roundName, date, time and mode are required' });
+  }
+  if (!Array.isArray(applicationIds) || applicationIds.length === 0) {
+    return res.status(400).json({ message: 'applicationIds[] must be a non-empty array' });
+  }
+  if (mode === 'Online' && !meetingLink) {
+    return res.status(400).json({ message: 'Meeting link is required for Online mode' });
+  }
+  if (mode === 'Offline' && !venue) {
+    return res.status(400).json({ message: 'Venue is required for Offline mode' });
+  }
+
+  const job = await Job.findById(jobId).populate('company', 'name');
+  if (!job) return res.status(404).json({ message: 'Job not found' });
+
+  // Fetch the applications with student & their User email
+  const apps = await Application.find({
+    _id: { $in: applicationIds },
+    job: jobId,
+  }).populate({ path: 'student', select: 'user name rollNumber' });
+
+  if (apps.length === 0) {
+    return res.status(400).json({ message: 'No matching applications found for the given IDs and job' });
+  }
+
+  // Format date for display
+  const displayDate = new Date(date).toLocaleDateString('en-IN', {
+    day: 'numeric', month: 'long', year: 'numeric',
+  });
+  const displayTime = (() => {
+    const [h, m] = time.split(':').map(Number);
+    const ampm = h >= 12 ? 'PM' : 'AM';
+    const h12 = h % 12 || 12;
+    return `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
+  })();
+
+  // ── Bulk-create Interview documents ──
+  const interviewDocs = apps.map((app) => ({
+    application: app._id,
+    student: app.student._id,
+    job: job._id,
+    roundNumber: Number(roundNumber),
+    roundName,
+    date: new Date(date),
+    time,
+    mode,
+    venue: mode === 'Offline' ? venue : meetingLink, // reuse venue field for both
+  }));
+
+  // insertMany with ordered:false — skip duplicates gracefully
+  let inserted = [];
+  try {
+    inserted = await Interview.insertMany(interviewDocs, { ordered: false });
+  } catch (err) {
+    // E11000 duplicates are acceptable — partial insert happened
+    inserted = err.insertedDocs || [];
+    console.warn('Some interview docs already existed and were skipped.');
+  }
+
+  // ── Update application status to 'Interview Scheduled' ──
+  await Application.bulkWrite(
+    apps.map((app) => ({
+      updateOne: {
+        filter: { _id: app._id },
+        update: {
+          $set: { status: 'Interview Scheduled' },
+          $push: { history: { status: 'Interview Scheduled', at: new Date() } },
+        },
+      },
+    })),
+    { ordered: false }
+  );
+
+  // ── Send notifications to every student ──
+  const portalUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+
+  for (const app of apps) {
+    const student = app.student;
+    if (!student?.user) continue;
+
+    // In-app notification
+    const shortMsg = `Your interview for ${job.title} at ${job.company.name} is scheduled on ${displayDate} at ${displayTime} (${mode}).`;
+    notify(student.user, `Interview Scheduled — ${roundName}`, shortMsg);
+
+    // Rich email
+    const userDoc = await User.findById(student.user).select('email');
+    if (userDoc?.email) {
+      await sendMail({
+        to: userDoc.email,
+        subject: `[Placement Cell] Interview Scheduled — ${job.title} at ${job.company.name}`,
+        text: shortMsg,
+        html: interviewNotificationTemplate({
+          studentName : student.name || 'Student',
+          companyName : job.company.name,
+          jobTitle    : job.title,
+          roundName,
+          roundNumber : Number(roundNumber),
+          date        : displayDate,
+          time        : displayTime,
+          mode,
+          meetingLink : meetingLink || '',
+          venue       : venue || '',
+          portalUrl,
+        }),
+      });
+    }
+  }
+
+  res.status(201).json({
+    message: `Interview scheduled for ${apps.length} student(s). Notifications sent.`,
+    scheduled: apps.length,
+    roundName,
+    date: displayDate,
+    time: displayTime,
+    mode,
   });
 }));
 

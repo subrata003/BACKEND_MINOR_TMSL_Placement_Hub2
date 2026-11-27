@@ -12,11 +12,48 @@ const notify = require('../utils/notify');
 async function notifyEligibleStudents(job) {
   try {
     if (job.status !== 'Open') return;
-    const students = await Student.find().select('user department degree cgpa percentage backlogs passingYear');
+
+    // Fetch all students with every field needed for eligibility check
+    const students = await Student.find()
+      .select('user name department degree cgpa percentage backlogs passingYear placementStatus');
+
+    const { sendMail, jobAnnouncementTemplate } = require('../utils/mailer');
+    const User = require('../models/User');
+
     for (const s of students) {
-      if (checkEligibility(s, job).eligible) {
-        notify(s.user, 'New placement drive',
-          `${job.company.name} is hiring for ${job.title}. Apply before ${new Date(job.deadline).toDateString()}.`);
+      // Skip already-placed students
+      if (s.placementStatus === 'Placed') continue;
+
+      const { eligible } = checkEligibility(s, job);
+      if (!eligible) continue;
+
+      const title   = 'New Placement Drive';
+      const message = `${job.company.name} is hiring for ${job.title}. Apply before ${new Date(job.deadline).toDateString()}.`;
+
+      // In-app notification
+      notify(s.user, title, message);
+
+      // Rich email – fetch the student's email from User collection
+      const userDoc = await User.findById(s.user).select('email');
+      if (userDoc?.email) {
+        const deadline = new Date(job.deadline).toLocaleDateString('en-IN', {
+          day: '2-digit', month: 'long', year: 'numeric',
+        });
+        sendMail({
+          to: userDoc.email,
+          subject: `[Placement Cell] New Drive: ${job.company.name} — ${job.title}`,
+          text: message,
+          html: jobAnnouncementTemplate({
+            studentName : s.name || 'Student',
+            companyName : job.company.name,
+            jobTitle    : job.title,
+            jobType     : job.jobType || 'Full-time',
+            location    : job.location || 'To be announced',
+            packageLPA  : job.package ? `${job.package} LPA` : 'As per company norms',
+            deadline,
+            portalUrl   : process.env.CLIENT_URL || 'http://localhost:5173',
+          }),
+        });
       }
     }
   } catch (e) {
