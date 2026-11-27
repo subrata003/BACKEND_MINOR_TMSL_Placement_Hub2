@@ -3,7 +3,7 @@ const path = require('path');
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, path.join(__dirname, '..', 'uploads', 'resumes')),
-  filename: (req, file, cb) => cb(null, `${req.user._id}-${Date.now()}.pdf`),
+  filename: (req, file, cb) => cb(null, `${req.user._id}-${Date.now()}-${file.originalname}`),
 });
 
 // PDF only, max 2 MB

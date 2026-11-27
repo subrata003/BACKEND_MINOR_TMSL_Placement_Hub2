@@ -10,6 +10,10 @@ const Notification = require('../models/Notification');
 const { protect, authorize } = require('../middleware/auth');
 const upload = require('../middleware/upload');
 const asyncHandler = require('../utils/asyncHandler');
+const {
+    uploadOnCloudinary,
+    deleteFromeCloudinary
+} = require("../service/cloudinary.service");
 
 router.use(protect);
 
@@ -22,7 +26,7 @@ router.get('/me', authorize('student'), asyncHandler(async (req, res) => {
   if (!student) return res.status(404).json({ message: 'Profile not found' });
   res.json(student);
 }));
-
+// update profile
 router.put('/me', authorize('student'), asyncHandler(async (req, res) => {
   const student = await Student.findOne({ user: req.user._id });
   if (!student) return res.status(404).json({ message: 'Profile not found' });
@@ -35,17 +39,98 @@ router.put('/me', authorize('student'), asyncHandler(async (req, res) => {
   res.json(student);
 }));
 
-router.post('/me/resume', authorize('student'), upload.single('resume'), asyncHandler(async (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'Please attach a PDF file' });
-  const student = await Student.findOne({ user: req.user._id });
-  if (student.resume) {
-    fs.unlink(path.join(__dirname, '..', student.resume), () => {}); // remove old file
-  }
-  student.resume = `/uploads/resumes/${req.file.filename}`;
-  await student.save();
-  res.json(student);
-}));
+// upload and update resume both are happend
 
+router.post(
+    "/me/resume",
+    authorize("student"),
+    upload.single("resume"),
+    asyncHandler(async (req, res) => {
+
+        // Check uploaded file
+        if (!req.file) {
+            return res.status(400).json({
+                success: false,
+                message: "Please attach a PDF file"
+            });
+        }
+
+        //  Find logged-in student's profile
+        const student = await Student.findOne({
+            user: req.user._id
+        });
+
+        if (!student) {
+            return res.status(404).json({
+                success: false,
+                message: "Student profile not found"
+            });
+        }
+
+        //  Store OLD public ID before updating
+        const oldPublicId = student.resume?.publicId;
+
+        //  Upload NEW resume to Cloudinary
+        const cloudinaryResult = await uploadOnCloudinary(
+            req.file.path,
+            "raw"
+        );
+
+        if (!cloudinaryResult) {
+            return res.status(500).json({
+                success: false,
+                message: "Resume upload failed"
+            });
+        }
+
+        console.log("NEW RESUME:", cloudinaryResult.public_id);
+        console.log("OLD RESUME:", oldPublicId);
+
+        //  Update student document
+        student.resume = {
+            url: cloudinaryResult.secure_url,
+            publicId: cloudinaryResult.public_id
+        };
+
+        try {
+            await student.save();
+
+        } catch (error) {
+
+            // Database save failed: delete NEW uploaded resume
+            await deleteFromeCloudinary(
+                cloudinaryResult.public_id,
+                "raw"
+            );
+
+            throw error;
+        }
+
+        //  Delete OLD resume only after successful DB save
+        if (
+            oldPublicId &&
+            oldPublicId !== cloudinaryResult.public_id
+        ) {
+            console.log("DELETING OLD RESUME:", oldPublicId);
+
+            const deleteResult = await deleteFromeCloudinary(
+                oldPublicId,
+                "raw"
+            );
+
+            if (!deleteResult.success) {
+                console.error("Old resume cleanup requires retry");
+            }
+        }
+
+        //  Send response
+        return res.status(200).json({
+            success: true,
+            message: "Resume uploaded successfully",
+            resume: student.resume
+        });
+    })
+);
 // ---------- Admin: manage students ----------
 // Search + filters: ?search=&department=&passingYear=&minCgpa=&placementStatus=&page=&limit=
 router.get('/', authorize('admin'), asyncHandler(async (req, res) => {
