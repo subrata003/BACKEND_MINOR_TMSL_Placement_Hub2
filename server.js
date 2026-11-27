@@ -9,6 +9,7 @@ const { notFound, errorHandler } = require('./middleware/error');
 
 // connectDB();
 fs.mkdirSync(path.join(__dirname, 'uploads', 'resumes'), { recursive: true });
+fs.mkdirSync(path.join(__dirname, 'uploads', 'excel'), { recursive: true });
 
 const app = express();
 app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173' }));
@@ -26,6 +27,7 @@ app.use('/api/interviews', require('./routes/interviews'));
 app.use('/api/results', require('./routes/results'));
 app.use('/api/notifications', require('./routes/notifications'));
 app.use('/api/dashboard', require('./routes/dashboard'));
+app.use('/api/bulk', require('./routes/bulkOps'));
 
 app.use(notFound);
 app.use(errorHandler);

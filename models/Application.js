@@ -8,6 +8,15 @@ const applicationSchema = new mongoose.Schema(
     job: { type: mongoose.Schema.Types.ObjectId, ref: 'Job', required: true },
     status: { type: String, enum: STATUSES, default: 'Applied' },
     history: [{ status: String, at: { type: Date, default: Date.now } }],
+    // Round tracking: 0 = not yet assigned, 1 = Round 1, 2 = Round 2, etc.
+    currentRound: { type: Number, default: 0, min: 0 },
+    roundHistory: [
+      {
+        round: Number,
+        assignedAt: { type: Date, default: Date.now },
+        note: String,
+      },
+    ],
   },
   { timestamps: true }
 );
