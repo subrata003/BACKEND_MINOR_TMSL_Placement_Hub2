@@ -1,22 +1,32 @@
 const mongoose = require('mongoose');
 
-const STATUSES = ['Applied', 'Under Review', 'Shortlisted', 'Interview Scheduled', 'Selected', 'Rejected', 'Withdrawn'];
+const STATUSES = [
+  'Applied', 'Under Review', 'Shortlisted', 'Interview Scheduled',
+  'Selected', 'Rejected', 'Withdrawn',
+];
 
 const applicationSchema = new mongoose.Schema(
   {
     student: { type: mongoose.Schema.Types.ObjectId, ref: 'Student', required: true },
-    job: { type: mongoose.Schema.Types.ObjectId, ref: 'Job', required: true },
-    status: { type: String, enum: STATUSES, default: 'Applied' },
+    job:     { type: mongoose.Schema.Types.ObjectId, ref: 'Job',     required: true },
+    status:  { type: String, enum: STATUSES, default: 'Applied' },
     history: [{ status: String, at: { type: Date, default: Date.now } }],
-    // Round tracking: 0 = not yet assigned, 1 = Round 1, 2 = Round 2, etc.
+
+
+    // Round tracking: 0 = not yet assigned to any round
     currentRound: { type: Number, default: 0, min: 0 },
     roundHistory: [
       {
-        round: Number,
+        round:      Number,
         assignedAt: { type: Date, default: Date.now },
-        note: String,
+        note:       String,
       },
     ],
+
+    // Rejection reason when auto-rejected between rounds
+    rejectionReason: String,
+    rejectionEmailSent: { type: Boolean, default: false },
+
   },
   { timestamps: true }
 );

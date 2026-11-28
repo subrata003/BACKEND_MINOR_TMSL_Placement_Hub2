@@ -1,105 +1,128 @@
 /**
- * Bulk Operations Routes
- * POST /api/bulk/assign-round1          - Assign all applied students to Round 1
- * POST /api/bulk/preview-shortlist      - Upload Excel and preview matched students
- * POST /api/bulk/confirm-shortlist      - Confirm and advance shortlisted students to next round
- * GET  /api/bulk/stats/:jobId           - Get round stats for a job
+
+ * bulkOps.js — All bulk round-management operations
+ *
+ * GET  /api/bulk/stats/:jobId              Job + round stats
+ * POST /api/bulk/assign-round1             Bulk-assign all applied → Round 1
+ * POST /api/bulk/preview-shortlist         Parse Excel, preview (no DB write)
+ * POST /api/bulk/confirm-shortlist         Advance matched → next round + auto-reject rest
+ * POST /api/bulk/schedule-interviews       Bulk schedule interviews + notify
+ * POST /api/bulk/preview-company-select    Parse company Excel, preview final selection
+ * POST /api/bulk/confirm-company-select    Finalise selection + lock job
+ * GET  /api/bulk/template/:type            Download Excel template
  */
 
 const router = require('express').Router();
-const path = require('path');
-const fs = require('fs');
-const XLSX = require('xlsx');
-const Application = require('../models/Application');
-const Student = require('../models/Student');
-const Job = require('../models/Job');
-const Interview = require('../models/Interview');
-const { protect, authorize } = require('../middleware/auth');
-const asyncHandler = require('../utils/asyncHandler');
-const uploadExcel = require('../middleware/uploadExcel');
-const notify = require('../utils/notify');
-const { sendMail, interviewNotificationTemplate } = require('../utils/mailer');
-const User = require('../models/User');
+const path   = require('path');
+const fs     = require('fs');
+const XLSX   = require('xlsx');
 
-// All bulk routes are admin-only
+const Application = require('../models/Application');
+const Student     = require('../models/Student');
+const Job         = require('../models/Job');
+const Interview   = require('../models/Interview');
+const User        = require('../models/User');
+
+const { protect, authorize }   = require('../middleware/auth');
+const asyncHandler             = require('../utils/asyncHandler');
+const uploadExcel              = require('../middleware/uploadExcel');
+const notify                   = require('../utils/notify');
+const {
+  sendMail, sendMailBatch,
+  interviewNotificationTemplate,
+  roundRejectionTemplate,
+  companySelectionTemplate,
+} = require('../utils/mailer');
+
 router.use(protect, authorize('admin'));
 
-// ─────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────
+/** Parse first column of an Excel/CSV file; returns array of string values */
+function parseRollNumbers(filePath) {
+  const workbook = XLSX.readFile(filePath);
+  const sheet    = workbook.Sheets[workbook.SheetNames[0]];
+  const rows     = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+  if (!rows.length) return [];
+
+  // Auto-detect roll-number column
+  const header = rows[0].map((h) => String(h).toLowerCase().replace(/[\s_\-]/g, ''));
+  const colIdx = (() => {
+    const i = header.findIndex((h) => ['rollno','rollnumber','roll','enrollmentno','studentroll'].includes(h));
+    return i >= 0 ? i : 0;
+  })();
+
+  return rows
+    .map((r) => String(r[colIdx] ?? '').trim())
+    .filter((v) => v && !/^[a-zA-Z]/.test(v)); // skip header text
+}
+
+function fmt12h(time) {
+  const [h, m] = time.split(':').map(Number);
+  return `${h % 12 || 12}:${String(m).padStart(2,'0')} ${h >= 12 ? 'PM' : 'AM'}`;
+}
+
+const TERMINAL = ['Rejected', 'Withdrawn', 'Selected'];
+
+// ─────────────────────────────────────────────────────────────────
 // GET /api/bulk/stats/:jobId
-// Returns applicant & round stats for a job
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 router.get('/stats/:jobId', asyncHandler(async (req, res) => {
-  const { jobId } = req.params;
-  const job = await Job.findById(jobId).populate('company', 'name');
+  const job = await Job.findById(req.params.jobId).populate('company', 'name');
   if (!job) return res.status(404).json({ message: 'Job not found' });
 
-  const allApps = await Application.find({ job: jobId });
-  const totalApplicants = allApps.length;
+  const allApps = await Application.find({ job: req.params.jobId });
 
-  // Count per round
   const roundCounts = {};
-  allApps.forEach((a) => {
-    const r = a.currentRound;
-    roundCounts[r] = (roundCounts[r] || 0) + 1;
-  });
+  allApps.forEach((a) => { roundCounts[a.currentRound] = (roundCounts[a.currentRound] || 0) + 1; });
 
-  // Active (not Rejected/Withdrawn/Selected) per round
-  const TERMINAL = ['Rejected', 'Withdrawn', 'Selected'];
-  const activeByRound = {};
-  allApps.forEach((a) => {
-    if (!TERMINAL.includes(a.status)) {
-      const r = a.currentRound;
-      activeByRound[r] = (activeByRound[r] || 0) + 1;
-    }
-  });
-
+  const maxRound         = allApps.reduce((m, a) => Math.max(m, a.currentRound), 0);
   const assignedToRound1 = allApps.filter((a) => a.currentRound >= 1).length;
-  const maxRound = allApps.reduce((m, a) => Math.max(m, a.currentRound), 0);
+  const totalSelected    = allApps.filter((a) => a.status === 'Selected').length;
+  const totalRejected    = allApps.filter((a) => a.status === 'Rejected').length;
 
   res.json({
-    job: { _id: job._id, title: job.title, company: job.company },
-    totalApplicants,
+    job: { _id: job._id, title: job.title, company: job.company, resultDeclared: job.resultDeclared },
+    totalApplicants: allApps.length,
     assignedToRound1,
     maxRound,
+    totalSelected,
+    totalRejected,
     roundCounts,
-    activeByRound,
   });
 }));
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // POST /api/bulk/assign-round1
 // Body: { jobId }
-// Assigns ALL non-terminal, not-yet-round-1 applications to Round 1
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+
 router.post('/assign-round1', asyncHandler(async (req, res) => {
   const { jobId } = req.body;
   if (!jobId) return res.status(400).json({ message: 'jobId is required' });
 
   const job = await Job.findById(jobId).populate('company', 'name');
-  if (!job) return res.status(404).json({ message: 'Job not found' });
 
-  // Only 'Applied' or 'Under Review' students not yet in any round
+  if (!job)              return res.status(404).json({ message: 'Job not found' });
+  if (job.resultDeclared) return res.status(400).json({ message: 'Results declared. Job is locked.' });
+
   const eligible = await Application.find({
-    job: jobId,
-    currentRound: 0,
-    status: { $in: ['Applied', 'Under Review'] },
+    job: jobId, currentRound: 0, status: { $in: ['Applied', 'Under Review'] },
   }).populate('student', 'user name rollNumber');
 
-  if (eligible.length === 0) {
-    return res.status(200).json({
-      message: 'No eligible applications to assign. All students are already assigned or in a terminal state.',
-      updated: 0,
-    });
+  if (!eligible.length) {
+    return res.json({ message: 'No eligible applications to assign.', updated: 0 });
   }
 
-  // bulkWrite for efficiency
+
   const bulkOps = eligible.map((app) => ({
     updateOne: {
       filter: { _id: app._id },
       update: {
         $set: { currentRound: 1, status: 'Shortlisted' },
         $push: {
+
           history: { status: 'Shortlisted', at: new Date() },
+
           roundHistory: { round: 1, assignedAt: new Date(), note: 'Bulk assigned to Round 1' },
         },
       },
@@ -108,126 +131,64 @@ router.post('/assign-round1', asyncHandler(async (req, res) => {
 
   const result = await Application.bulkWrite(bulkOps, { ordered: false });
 
-  // Fire notifications asynchronously (non-blocking)
   eligible.forEach((app) => {
-    if (app.student?.user) {
-      notify(
-        app.student.user,
-        'Round 1 Assignment',
-        `You have been assigned to Round 1 for ${job.title} at ${job.company.name}. Congratulations!`
-      );
-    }
+    if (app.student?.user) notify(app.student.user, 'Assigned to Round 1',
+      `You have been assigned to Round 1 for ${job.title} at ${job.company.name}.`);
   });
 
-  res.json({
-    message: `Successfully assigned ${result.modifiedCount} student(s) to Round 1.`,
-    updated: result.modifiedCount,
-    total: eligible.length,
-  });
+  res.json({ message: `${result.modifiedCount} student(s) assigned to Round 1.`, updated: result.modifiedCount });
 }));
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // POST /api/bulk/preview-shortlist
-// Multipart: file (Excel/CSV) + body { jobId, currentRound (number) }
-// Returns a preview without writing to DB
-// ─────────────────────────────────────────────
+// Multipart: file + { jobId, currentRound }
+// ─────────────────────────────────────────────────────────────────
 router.post('/preview-shortlist', uploadExcel.single('file'), asyncHandler(async (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'Please upload an Excel or CSV file' });
+  if (!req.file) return res.status(400).json({ message: 'Please upload a file' });
 
   const { jobId, currentRound } = req.body;
-  if (!jobId || currentRound === undefined) {
-    fs.unlinkSync(req.file.path);
-    return res.status(400).json({ message: 'jobId and currentRound are required' });
-  }
+  const cleanup = () => { try { fs.unlinkSync(req.file.path); } catch (_) {} };
+
+  if (!jobId || currentRound === undefined) { cleanup(); return res.status(400).json({ message: 'jobId and currentRound are required' }); }
 
   const round = parseInt(currentRound, 10);
-  if (isNaN(round) || round < 1) {
-    fs.unlinkSync(req.file.path);
-    return res.status(400).json({ message: 'currentRound must be a positive integer' });
-  }
+  if (isNaN(round) || round < 1) { cleanup(); return res.status(400).json({ message: 'currentRound must be ≥ 1' }); }
 
   const job = await Job.findById(jobId).populate('company', 'name');
-  if (!job) {
-    fs.unlinkSync(req.file.path);
-    return res.status(404).json({ message: 'Job not found' });
-  }
+  if (!job)               { cleanup(); return res.status(404).json({ message: 'Job not found' }); }
+  if (job.resultDeclared) { cleanup(); return res.status(400).json({ message: 'Results declared. Job is locked.' }); }
 
-  // ── Parse Excel / CSV ──
-  let rollNumbers = [];
-  try {
-    const workbook = XLSX.readFile(req.file.path);
-    const sheetName = workbook.SheetNames[0];
-    const sheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+  let rawRolls;
+  try { rawRolls = parseRollNumbers(req.file.path); }
+  catch (e) { cleanup(); return res.status(400).json({ message: `Parse error: ${e.message}` }); }
+  finally   { cleanup(); }
 
-    // Try to auto-detect which column contains roll numbers
-    // Accept first column, or any column with header matching rollNumber / roll_no / roll no etc.
-    let rollCol = 0;
-    if (rows.length > 0) {
-      const header = rows[0].map((h) => String(h).toLowerCase().replace(/[\s_-]/g, ''));
-      const idx = header.findIndex((h) =>
-        ['rollno', 'rollnumber', 'roll', 'studentroll', 'enrollmentno'].includes(h)
-      );
-      rollCol = idx >= 0 ? idx : 0;
-    }
+  // Dedup
+  const seen = new Set(); const duplicates = []; const unique = [];
+  rawRolls.forEach((r) => { if (seen.has(r)) duplicates.push(r); else { seen.add(r); unique.push(r); } });
 
-    // Collect values, skip header row if it's non-numeric
-    rows.forEach((row, i) => {
-      const cell = String(row[rollCol] ?? '').trim();
-      if (cell && !/^[a-z]/i.test(cell)) rollNumbers.push(cell); // skip text headers
-    });
-  } catch (err) {
-    fs.unlinkSync(req.file.path);
-    return res.status(400).json({ message: `Could not parse file: ${err.message}` });
-  } finally {
-    // Always clean up temp file
-    try { fs.unlinkSync(req.file.path); } catch (_) {}
-  }
-
-  // ── Deduplicate ──
-  const seen = new Set();
-  const duplicates = [];
-  const unique = [];
-  rollNumbers.forEach((r) => {
-    if (seen.has(r)) { duplicates.push(r); } else { seen.add(r); unique.push(r); }
-  });
-
-  const totalInFile = rollNumbers.length;
-
-  // ── Match students in DB ──
-  const students = await Student.find({ rollNumber: { $in: unique } }).select('_id name rollNumber user');
-  const foundRollSet = new Set(students.map((s) => s.rollNumber));
-  const notFound = unique.filter((r) => !foundRollSet.has(r));
-
-  // ── Find applications for this job ──
-  const studentIds = students.map((s) => s._id);
+  const students    = await Student.find({ rollNumber: { $in: unique } }).select('_id name rollNumber user');
+  const foundSet    = new Set(students.map((s) => s.rollNumber));
+  const notFound    = unique.filter((r) => !foundSet.has(r));
+  const studentIds  = students.map((s) => s._id);
   const applications = await Application.find({ job: jobId, student: { $in: studentIds } })
     .populate('student', 'name rollNumber');
 
-  const appByStudentId = {};
-  applications.forEach((a) => { appByStudentId[String(a.student._id)] = a; });
+  const appBySid = {};
+  applications.forEach((a) => { appBySid[String(a.student._id)] = a; });
 
-  // Students found in DB but did not apply
-  const didNotApply = students
-    .filter((s) => !appByStudentId[String(s._id)])
-    .map((s) => ({ rollNumber: s.rollNumber, name: s.name }));
+  const didNotApply    = students.filter((s) => !appBySid[String(s._id)]).map((s) => ({ rollNumber: s.rollNumber, name: s.name }));
+  const eligibleApps   = [];
+  const wrongRound     = [];
+  const alreadyProcessed = [];
 
-  // Among applicants: check round eligibility
-  const eligibleApps = [];
-  const wrongRound = [];   // in DB but not in the expected current round
-  const alreadyProcessed = []; // already in round+1 or beyond
 
   applications.forEach((app) => {
     const rn = app.student.rollNumber;
     if (app.currentRound === round) {
-      eligibleApps.push({
-        applicationId: app._id,
-        studentId: app.student._id,
-        rollNumber: rn,
-        name: app.student.name,
-        currentRound: app.currentRound,
-        status: app.status,
-      });
+
+      eligibleApps.push({ applicationId: app._id, studentId: app.student._id, rollNumber: rn, name: app.student.name, currentRound: app.currentRound, status: app.status });
+
     } else if (app.currentRound > round) {
       alreadyProcessed.push({ rollNumber: rn, name: app.student.name, currentRound: app.currentRound });
     } else {
@@ -235,246 +196,340 @@ router.post('/preview-shortlist', uploadExcel.single('file'), asyncHandler(async
     }
   });
 
+
+  // Students who were in this round but NOT in the Excel → will be auto-rejected
+  const eligibleStudentIds = new Set(eligibleApps.map((e) => String(e.studentId)));
+  const willBeRejected = applications
+    .filter((a) => a.currentRound === round && !TERMINAL.includes(a.status) && !eligibleStudentIds.has(String(a.student._id)))
+    .map((a) => ({ rollNumber: a.student.rollNumber, name: a.student.name, applicationId: a._id }));
+
   res.json({
     summary: {
-      totalInFile,
-      uniqueInFile: unique.length,
-      duplicates: duplicates.length,
-      matched: students.length,
-      notFound: notFound.length,
-      didNotApply: didNotApply.length,
-      wrongRound: wrongRound.length,
-      alreadyProcessed: alreadyProcessed.length,
-      eligibleToAdvance: eligibleApps.length,
+      totalInFile: rawRolls.length, uniqueInFile: unique.length, duplicates: duplicates.length,
+      matched: students.length, notFound: notFound.length, didNotApply: didNotApply.length,
+      wrongRound: wrongRound.length, alreadyProcessed: alreadyProcessed.length,
+      eligibleToAdvance: eligibleApps.length, willBeRejected: willBeRejected.length,
     },
-    details: {
-      duplicates,
-      notFound,
-      didNotApply,
-      wrongRound,
-      alreadyProcessed,
-      eligible: eligibleApps,
-    },
-    meta: {
-      jobId,
-      jobTitle: job.title,
-      company: job.company?.name,
-      currentRound: round,
-      nextRound: round + 1,
-    },
+    details: { duplicates, notFound, didNotApply, wrongRound, alreadyProcessed, eligible: eligibleApps, willBeRejected },
+    meta: { jobId, jobTitle: job.title, company: job.company?.name, currentRound: round, nextRound: round + 1 },
   });
 }));
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // POST /api/bulk/confirm-shortlist
-// Body: { jobId, currentRound, applicationIds: [...] }
-// Advances confirmed applicationIds from currentRound → currentRound+1
-// ─────────────────────────────────────────────
+// Body: { jobId, currentRound, applicationIds, autoRejectOthers? }
+// ─────────────────────────────────────────────────────────────────
 router.post('/confirm-shortlist', asyncHandler(async (req, res) => {
-  const { jobId, currentRound, applicationIds } = req.body;
-
-  if (!jobId || currentRound === undefined || !Array.isArray(applicationIds) || applicationIds.length === 0) {
-    return res.status(400).json({ message: 'jobId, currentRound, and applicationIds[] are required' });
+  const { jobId, currentRound, applicationIds, autoRejectOthers = true } = req.body;
+  if (!jobId || currentRound === undefined || !Array.isArray(applicationIds) || !applicationIds.length) {
+    return res.status(400).json({ message: 'jobId, currentRound and applicationIds[] are required' });
   }
-
   const round = parseInt(currentRound, 10);
-  if (isNaN(round) || round < 1) return res.status(400).json({ message: 'currentRound must be a positive integer' });
-
-  const job = await Job.findById(jobId).populate('company', 'name');
-  if (!job) return res.status(404).json({ message: 'Job not found' });
+  const job   = await Job.findById(jobId).populate('company', 'name');
+  if (!job)              return res.status(404).json({ message: 'Job not found' });
+  if (job.resultDeclared) return res.status(400).json({ message: 'Results declared. Job is locked.' });
 
   const nextRound = round + 1;
+  const advancedSet = new Set(applicationIds.map(String));
 
-  // Validate: only advance apps that are in the correct round and not terminal
-  const TERMINAL = ['Rejected', 'Withdrawn', 'Selected'];
-  const apps = await Application.find({
-    _id: { $in: applicationIds },
-    job: jobId,
-    currentRound: round,
-    status: { $nin: TERMINAL },
+  // Advance matched apps
+  const toAdvance = await Application.find({
+    _id: { $in: applicationIds }, job: jobId, currentRound: round, status: { $nin: TERMINAL },
   }).populate('student', 'user name rollNumber');
 
-  if (apps.length === 0) {
-    return res.status(400).json({
-      message: 'No valid applications found to advance. They may already be processed or not in the expected round.',
-    });
-  }
+  if (!toAdvance.length) return res.status(400).json({ message: 'No valid applications to advance.' });
 
-  // bulkWrite
-  const bulkOps = apps.map((app) => ({
+  const advanceOps = toAdvance.map((app) => ({
+
     updateOne: {
       filter: { _id: app._id },
       update: {
         $set: { currentRound: nextRound, status: 'Shortlisted' },
         $push: {
-          history: { status: 'Shortlisted', at: new Date() },
-          roundHistory: {
-            round: nextRound,
-            assignedAt: new Date(),
-            note: `Advanced from Round ${round} to Round ${nextRound} via Excel import`,
-          },
+
+          history:      { status: 'Shortlisted', at: new Date() },
+          roundHistory: { round: nextRound, assignedAt: new Date(), note: `Advanced R${round}→R${nextRound} via Excel` },
+
         },
       },
     },
   }));
 
-  const result = await Application.bulkWrite(bulkOps, { ordered: false });
+  await Application.bulkWrite(advanceOps, { ordered: false });
 
-  // Notify students
-  apps.forEach((app) => {
-    if (app.student?.user) {
-      notify(
-        app.student.user,
-        `Shortlisted for Round ${nextRound}`,
-        `Congratulations! You have been shortlisted for Round ${nextRound} of ${job.title} at ${job.company.name}.`
-      );
+  // Auto-reject remaining Round-N students not in the uploaded list
+  let rejectedCount = 0;
+  if (autoRejectOthers) {
+    const toReject = await Application.find({
+      job: jobId, currentRound: round, status: { $nin: TERMINAL },
+      _id: { $nin: applicationIds },
+    }).populate('student', 'user name rollNumber');
+
+    if (toReject.length) {
+      const rejectOps = toReject.map((app) => ({
+        updateOne: {
+          filter: { _id: app._id },
+          update: {
+            $set: { status: 'Rejected', rejectionReason: `Not shortlisted after Round ${round}`, rejectionEmailSent: false },
+            $push: { history: { status: 'Rejected', at: new Date() } },
+          },
+        },
+      }));
+      await Application.bulkWrite(rejectOps, { ordered: false });
+      rejectedCount = toReject.length;
+
+      // Send rejection emails in batch
+      const portalUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+      const rejectMsgs = [];
+      for (const app of toReject) {
+        const userDoc = await User.findById(app.student?.user).select('email');
+        if (userDoc?.email) {
+          rejectMsgs.push({
+            to:      userDoc.email,
+            subject: `[Placement Cell] Result — ${job.title} at ${job.company.name}`,
+            text:    `Dear ${app.student.name}, you have not been shortlisted for Round ${nextRound} of ${job.title}.`,
+            html:    roundRejectionTemplate({ studentName: app.student.name, companyName: job.company.name, jobTitle: job.title, roundNumber: round, portalUrl }),
+          });
+        }
+        notify(app.student?.user, `Not shortlisted for Round ${nextRound}`,
+          `You were not shortlisted for Round ${nextRound} of ${job.title} at ${job.company.name}.`);
+      }
+      await sendMailBatch(rejectMsgs);
+      // Mark emails sent
+      await Application.updateMany({ _id: { $in: toReject.map((a) => a._id) } }, { rejectionEmailSent: true });
     }
+  }
+
+  // Notify advanced students
+  toAdvance.forEach((app) => {
+    if (app.student?.user) notify(app.student.user, `Shortlisted for Round ${nextRound}`,
+      `Congratulations! You are shortlisted for Round ${nextRound} of ${job.title} at ${job.company.name}.`);
   });
 
   res.json({
-    message: `Successfully advanced ${result.modifiedCount} student(s) to Round ${nextRound}.`,
-    updated: result.modifiedCount,
-    nextRound,
+    message: `${toAdvance.length} student(s) advanced to Round ${nextRound}. ${rejectedCount} rejected.`,
+    advanced: toAdvance.length, rejected: rejectedCount, nextRound,
+    advancedApplicationIds: toAdvance.map((a) => String(a._id)),
   });
 }));
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 // POST /api/bulk/schedule-interviews
-// Body: {
-//   jobId, roundNumber, roundName,
-//   date (ISO string), time (HH:MM),
-//   mode ('Online' | 'Offline'),
-//   meetingLink (if Online), venue (if Offline),
-//   applicationIds: [...] — the apps just advanced
-// }
-// Creates Interview docs for all matched students
-// and sends rich email + in-app notification
-// ─────────────────────────────────────────────
+// Body: { jobId, roundNumber, roundName, date, time, mode,
+//         meetingLink?, venue?, additionalInstructions?, applicationIds[] }
+// ─────────────────────────────────────────────────────────────────
 router.post('/schedule-interviews', asyncHandler(async (req, res) => {
-  const {
-    jobId, roundNumber, roundName,
-    date, time, mode, meetingLink, venue,
-    applicationIds,
-  } = req.body;
+  const { jobId, roundNumber, roundName, date, time, mode, meetingLink, venue, additionalInstructions, applicationIds } = req.body;
 
-  // Validate required fields
   if (!jobId || !roundNumber || !roundName || !date || !time || !mode) {
     return res.status(400).json({ message: 'jobId, roundNumber, roundName, date, time and mode are required' });
   }
-  if (!Array.isArray(applicationIds) || applicationIds.length === 0) {
-    return res.status(400).json({ message: 'applicationIds[] must be a non-empty array' });
+  if (!Array.isArray(applicationIds) || !applicationIds.length) {
+    return res.status(400).json({ message: 'applicationIds[] must be non-empty' });
   }
-  if (mode === 'Online' && !meetingLink) {
-    return res.status(400).json({ message: 'Meeting link is required for Online mode' });
-  }
-  if (mode === 'Offline' && !venue) {
-    return res.status(400).json({ message: 'Venue is required for Offline mode' });
-  }
+  if (mode === 'Online'  && !meetingLink) return res.status(400).json({ message: 'Meeting link required for Online mode' });
+  if (mode === 'Offline' && !venue)       return res.status(400).json({ message: 'Venue required for Offline mode' });
 
   const job = await Job.findById(jobId).populate('company', 'name');
-  if (!job) return res.status(404).json({ message: 'Job not found' });
+  if (!job)              return res.status(404).json({ message: 'Job not found' });
+  if (job.resultDeclared) return res.status(400).json({ message: 'Results declared. Job is locked.' });
 
-  // Fetch the applications with student & their User email
-  const apps = await Application.find({
-    _id: { $in: applicationIds },
-    job: jobId,
-  }).populate({ path: 'student', select: 'user name rollNumber' });
+  const apps = await Application.find({ _id: { $in: applicationIds }, job: jobId })
+    .populate({ path: 'student', select: 'user name rollNumber' });
 
-  if (apps.length === 0) {
-    return res.status(400).json({ message: 'No matching applications found for the given IDs and job' });
-  }
+  if (!apps.length) return res.status(400).json({ message: 'No matching applications found' });
 
-  // Format date for display
-  const displayDate = new Date(date).toLocaleDateString('en-IN', {
-    day: 'numeric', month: 'long', year: 'numeric',
-  });
-  const displayTime = (() => {
-    const [h, m] = time.split(':').map(Number);
-    const ampm = h >= 12 ? 'PM' : 'AM';
-    const h12 = h % 12 || 12;
-    return `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
-  })();
+  const displayDate = new Date(date).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+  const displayTime = fmt12h(time);
+  const venueField  = mode === 'Online' ? meetingLink : venue;
 
-  // ── Bulk-create Interview documents ──
-  const interviewDocs = apps.map((app) => ({
-    application: app._id,
-    student: app.student._id,
-    job: job._id,
-    roundNumber: Number(roundNumber),
-    roundName,
-    date: new Date(date),
-    time,
-    mode,
-    venue: mode === 'Offline' ? venue : meetingLink, // reuse venue field for both
+  // Insert Interview docs (skip duplicates)
+  const ivDocs = apps.map((app) => ({
+    application: app._id, student: app.student._id, job: job._id,
+    roundNumber: Number(roundNumber), roundName, date: new Date(date),
+    time, mode, venue: venueField, additionalInstructions,
   }));
+  try { await Interview.insertMany(ivDocs, { ordered: false }); }
+  catch (e) { /* E11000 partial insert ok */ }
 
-  // insertMany with ordered:false — skip duplicates gracefully
-  let inserted = [];
-  try {
-    inserted = await Interview.insertMany(interviewDocs, { ordered: false });
-  } catch (err) {
-    // E11000 duplicates are acceptable — partial insert happened
-    inserted = err.insertedDocs || [];
-    console.warn('Some interview docs already existed and were skipped.');
-  }
+  // Update application status
+  await Application.bulkWrite(apps.map((app) => ({
+    updateOne: {
+      filter: { _id: app._id },
+      update: { $set: { status: 'Interview Scheduled' }, $push: { history: { status: 'Interview Scheduled', at: new Date() } } },
+    },
+  })), { ordered: false });
 
-  // ── Update application status to 'Interview Scheduled' ──
-  await Application.bulkWrite(
-    apps.map((app) => ({
-      updateOne: {
-        filter: { _id: app._id },
-        update: {
-          $set: { status: 'Interview Scheduled' },
-          $push: { history: { status: 'Interview Scheduled', at: new Date() } },
-        },
-      },
-    })),
-    { ordered: false }
-  );
-
-  // ── Send notifications to every student ──
+  // Send interview notification emails in batch
   const portalUrl = process.env.CLIENT_URL || 'http://localhost:5173';
-
+  const mailMsgs  = [];
   for (const app of apps) {
-    const student = app.student;
-    if (!student?.user) continue;
-
-    // In-app notification
-    const shortMsg = `Your interview for ${job.title} at ${job.company.name} is scheduled on ${displayDate} at ${displayTime} (${mode}).`;
-    notify(student.user, `Interview Scheduled — ${roundName}`, shortMsg);
-
-    // Rich email
-    const userDoc = await User.findById(student.user).select('email');
+    const userDoc = await User.findById(app.student?.user).select('email');
+    const shortMsg = `Your interview for ${job.title} at ${job.company.name} is on ${displayDate} at ${displayTime} (${mode}).`;
+    notify(app.student?.user, `Interview Scheduled — ${roundName}`, shortMsg);
     if (userDoc?.email) {
-      await sendMail({
-        to: userDoc.email,
-        subject: `[Placement Cell] Interview Scheduled — ${job.title} at ${job.company.name}`,
-        text: shortMsg,
-        html: interviewNotificationTemplate({
-          studentName : student.name || 'Student',
-          companyName : job.company.name,
-          jobTitle    : job.title,
-          roundName,
-          roundNumber : Number(roundNumber),
-          date        : displayDate,
-          time        : displayTime,
-          mode,
-          meetingLink : meetingLink || '',
-          venue       : venue || '',
-          portalUrl,
+      mailMsgs.push({
+        to:      userDoc.email,
+        subject: `[Placement Cell] Interview Scheduled — ${job.title}`,
+        text:    shortMsg,
+        html:    interviewNotificationTemplate({
+          studentName: app.student.name || 'Student', companyName: job.company.name,
+          jobTitle: job.title, roundName, roundNumber: Number(roundNumber),
+          date: displayDate, time: displayTime, mode,
+          meetingLink: meetingLink || '', venue: venue || '',
+          additionalInstructions, portalUrl,
+
         }),
       });
     }
   }
 
+  const emailResults = await sendMailBatch(mailMsgs);
+  const emailsFailed = emailResults.filter((r) => !r.success).length;
+
   res.status(201).json({
-    message: `Interview scheduled for ${apps.length} student(s). Notifications sent.`,
-    scheduled: apps.length,
-    roundName,
-    date: displayDate,
-    time: displayTime,
-    mode,
+    message: `Interview scheduled for ${apps.length} student(s). Emails: ${apps.length - emailsFailed} sent, ${emailsFailed} failed.`,
+    scheduled: apps.length, roundName, date: displayDate, time: displayTime, mode,
   });
 }));
+
+// ─────────────────────────────────────────────────────────────────
+// POST /api/bulk/preview-company-select
+// Multipart: file + { jobId, instructions? }
+// ─────────────────────────────────────────────────────────────────
+router.post('/preview-company-select', uploadExcel.single('file'), asyncHandler(async (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'Please upload a file' });
+  const { jobId } = req.body;
+  const cleanup = () => { try { fs.unlinkSync(req.file.path); } catch (_) {} };
+
+  if (!jobId) { cleanup(); return res.status(400).json({ message: 'jobId is required' }); }
+
+  const job = await Job.findById(jobId).populate('company', 'name');
+  if (!job) { cleanup(); return res.status(404).json({ message: 'Job not found' }); }
+  if (job.resultDeclared) { cleanup(); return res.status(400).json({ message: 'Results already declared for this job.' }); }
+
+  let rawRolls;
+  try { rawRolls = parseRollNumbers(req.file.path); }
+  catch (e) { cleanup(); return res.status(400).json({ message: `Parse error: ${e.message}` }); }
+  finally   { cleanup(); }
+
+  const seen = new Set(); const duplicates = []; const unique = [];
+  rawRolls.forEach((r) => { if (seen.has(r)) duplicates.push(r); else { seen.add(r); unique.push(r); } });
+
+  const students   = await Student.find({ rollNumber: { $in: unique } }).select('_id name rollNumber');
+  const foundSet   = new Set(students.map((s) => s.rollNumber));
+  const notFound   = unique.filter((r) => !foundSet.has(r));
+  const studentIds = students.map((s) => s._id);
+
+  const applications = await Application.find({ job: jobId, student: { $in: studentIds } })
+    .populate('student', 'name rollNumber');
+
+  const appBySid = {};
+  applications.forEach((a) => { appBySid[String(a.student._id)] = a; });
+
+  const didNotApply    = students.filter((s) => !appBySid[String(s._id)]).map((s) => ({ rollNumber: s.rollNumber, name: s.name }));
+  const alreadySelected = applications.filter((a) => a.status === 'Selected').map((a) => ({ rollNumber: a.student.rollNumber, name: a.student.name }));
+  const eligibleToSelect = applications.filter((a) => a.status !== 'Selected' && a.status !== 'Withdrawn' && a.status !== 'Rejected')
+    .map((a) => ({ applicationId: a._id, studentId: a.student._id, rollNumber: a.student.rollNumber, name: a.student.name }));
+
+  res.json({
+    summary: {
+      totalInFile: rawRolls.length, uniqueInFile: unique.length, duplicates: duplicates.length,
+      matched: students.length, notFound: notFound.length, didNotApply: didNotApply.length,
+      alreadySelected: alreadySelected.length, eligibleToSelect: eligibleToSelect.length,
+    },
+    details: { duplicates, notFound, didNotApply, alreadySelected, eligible: eligibleToSelect },
+    meta: { jobId, jobTitle: job.title, company: job.company?.name },
+  });
+}));
+
+// ─────────────────────────────────────────────────────────────────
+// POST /api/bulk/confirm-company-select
+// Body: { jobId, applicationIds[], instructions? }
+// ─────────────────────────────────────────────────────────────────
+router.post('/confirm-company-select', asyncHandler(async (req, res) => {
+  const { jobId, applicationIds, instructions } = req.body;
+  if (!jobId || !Array.isArray(applicationIds) || !applicationIds.length) {
+    return res.status(400).json({ message: 'jobId and applicationIds[] are required' });
+  }
+
+  const job = await Job.findById(jobId).populate('company', 'name');
+  if (!job)              return res.status(404).json({ message: 'Job not found' });
+  if (job.resultDeclared) return res.status(400).json({ message: 'Results already declared for this job.' });
+
+  const apps = await Application.find({
+    _id: { $in: applicationIds }, job: jobId, status: { $nin: ['Selected', 'Withdrawn', 'Rejected'] },
+  }).populate({ path: 'student', select: 'user name rollNumber' });
+
+  if (!apps.length) return res.status(400).json({ message: 'No valid applications to confirm.' });
+
+  // Mark selected
+  await Application.bulkWrite(apps.map((app) => ({
+    updateOne: {
+      filter: { _id: app._id },
+      update: { $set: { status: 'Selected' }, $push: { history: { status: 'Selected', at: new Date() } } },
+    },
+  })), { ordered: false });
+
+  // Update student placement status
+  await Student.bulkWrite(apps.map((app) => ({
+    updateOne: {
+      filter: { _id: app.student._id },
+      update: { $set: { placementStatus: 'Placed', placedCompany: job.company.name } },
+    },
+  })), { ordered: false });
+
+  // Lock the job
+  await Job.findByIdAndUpdate(jobId, {
+    resultDeclared: true, resultDeclaredAt: new Date(), status: 'Closed',
+  });
+
+  // Send selection emails in batch
+  const portalUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+  const mailMsgs  = [];
+  for (const app of apps) {
+    const userDoc = await User.findById(app.student?.user).select('email');
+    notify(app.student?.user, '🎉 Selected by Company!',
+      `Congratulations! You have been selected by ${job.company.name} for ${job.title}.`);
+    if (userDoc?.email) {
+      mailMsgs.push({
+        to:      userDoc.email,
+        subject: `[Placement Cell] 🎉 You are Selected — ${job.title} at ${job.company.name}`,
+        text:    `Congratulations ${app.student.name}! You have been selected by ${job.company.name} for ${job.title}.`,
+        html:    companySelectionTemplate({
+          studentName: app.student.name || 'Student', companyName: job.company.name,
+          jobTitle: job.title, instructions, portalUrl,
+        }),
+      });
+    }
+  }
+  const emailResults = await sendMailBatch(mailMsgs);
+
+  res.json({
+    message: `${apps.length} student(s) marked as Selected. Job locked. Emails sent.`,
+    selected: apps.length,
+    emailsSent: emailResults.filter((r) => r.success).length,
+  });
+}));
+
+// ─────────────────────────────────────────────────────────────────
+// GET /api/bulk/template/:type  — Download Excel template
+// type: 'shortlist' or 'selection'
+// ─────────────────────────────────────────────────────────────────
+router.get('/template/:type', asyncHandler(async (req, res) => {
+  const { type } = req.params;
+  const label = type === 'selection' ? 'Company_Final_Selection' : 'Round_Shortlist';
+  const wb    = XLSX.utils.book_new();
+  const ws    = XLSX.utils.aoa_to_sheet([
+    ['Roll Number']
+  ]);
+  ws['!cols'] = [{ wch: 20 }];
+  XLSX.utils.book_append_sheet(wb, ws, 'Roll Numbers');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Disposition', `attachment; filename="${label}_Template.xlsx"`);
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.send(buf);
+}));
+
 
 module.exports = router;

@@ -21,7 +21,19 @@ const studentSchema = new mongoose.Schema(
     tenthPercentage: { type: Number, min: 0, max: 100 },
     twelfthPercentage: { type: Number, min: 0, max: 100 },
     backlogs: { type: Number, default: 0, min: 0 },
-    resume: String,
+     resume: {
+      url: {
+        type: String,
+        trim: true,
+        
+      },
+
+      publicId: {
+        type: String,
+        trim: true,
+       
+      }
+    },
     placementStatus: { type: String, enum: ['Unplaced', 'Placed'], default: 'Unplaced' },
     placedCompany: String,
     placedPackage: Number,
@@ -32,7 +44,7 @@ const studentSchema = new mongoose.Schema(
 studentSchema.index({ department: 1, passingYear: 1, cgpa: -1 });
 
 studentSchema.virtual('profileCompletion').get(function () {
-  const fields = ['rollNo', 'phone', 'department', 'degree', 'passingYear', 'cgpa', 'percentage', 'tenthPercentage', 'twelfthPercentage', 'resume'];
+  const fields = ['rollNumber', 'phone', 'department', 'degree', 'passingYear', 'cgpa', 'percentage', 'tenthPercentage', 'twelfthPercentage', 'resume'];
   const filled = fields.filter((f) => this[f] !== undefined && this[f] !== null && this[f] !== '').length;
   return Math.round((filled / fields.length) * 100);
 });
