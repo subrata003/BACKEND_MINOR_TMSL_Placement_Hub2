@@ -10,14 +10,9 @@ const Notification = require('../models/Notification');
 const { protect, authorize } = require('../middleware/auth');
 const upload    = require('../middleware/upload');
 const asyncHandler = require('../utils/asyncHandler');
-<<<<<<< Updated upstream
-const {
-    uploadOnCloudinary,
-    deleteFromeCloudinary
-} = require("../service/cloudinary.service");
-=======
+
 const { isValidPhone, PHONE_ERROR } = require('../utils/phoneValidator');
->>>>>>> Stashed changes
+
 
 router.use(protect);
 
@@ -30,12 +25,10 @@ router.get('/me', authorize('student'), asyncHandler(async (req, res) => {
   if (!student) return res.status(404).json({ message: 'Profile not found' });
   res.json(student);
 }));
-<<<<<<< Updated upstream
-// update profile
-=======
+
 
 // ── Student: update own profile ──────────────────────────────────
->>>>>>> Stashed changes
+
 router.put('/me', authorize('student'), asyncHandler(async (req, res) => {
   const student = await Student.findOne({ user: req.user._id });
   if (!student) return res.status(404).json({ message: 'Profile not found' });
@@ -56,7 +49,7 @@ router.put('/me', authorize('student'), asyncHandler(async (req, res) => {
   res.json(student);
 }));
 
-<<<<<<< Updated upstream
+
 // upload and update resume both are happend
 
 router.post(
@@ -151,19 +144,7 @@ router.post(
 );
 // ---------- Admin: manage students ----------
 // Search + filters: ?search=&department=&passingYear=&minCgpa=&placementStatus=&page=&limit=
-=======
-// ── Student: upload resume ────────────────────────────────────────
-router.post('/me/resume', authorize('student'), upload.single('resume'), asyncHandler(async (req, res) => {
-  if (!req.file) return res.status(400).json({ message: 'Please attach a PDF file' });
-  const student = await Student.findOne({ user: req.user._id });
-  if (student.resume) fs.unlink(path.join(__dirname, '..', student.resume), () => {});
-  student.resume = `/uploads/resumes/${req.file.filename}`;
-  await student.save();
-  res.json(student);
-}));
 
-// ── Admin: list students ──────────────────────────────────────────
->>>>>>> Stashed changes
 router.get('/', authorize('admin'), asyncHandler(async (req, res) => {
   const { search, department, passingYear, minCgpa, placementStatus } = req.query;
   const page  = Math.max(parseInt(req.query.page)  || 1, 1);
