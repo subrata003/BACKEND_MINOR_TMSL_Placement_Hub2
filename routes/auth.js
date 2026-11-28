@@ -8,7 +8,7 @@ const { protect } = require('../middleware/auth');
 const asyncHandler = require('../utils/asyncHandler');
 const { sendMail, template } = require('../utils/mailer');
 
-const crypto = require('crypto');
+// const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const OtpVerification = require('../models/OtpVerification');
 
