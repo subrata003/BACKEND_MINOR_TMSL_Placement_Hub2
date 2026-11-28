@@ -1,35 +1,52 @@
 const router = require('express').Router();
-const fs = require('fs');
-const path = require('path');
+const fs      = require('fs');
+const path    = require('path');
 const Student = require('../models/Student');
-const User = require('../models/User');
+const User    = require('../models/User');
 const Application = require('../models/Application');
-const Interview = require('../models/Interview');
-const Result = require('../models/Result');
+const Interview   = require('../models/Interview');
+const Result      = require('../models/Result');
 const Notification = require('../models/Notification');
 const { protect, authorize } = require('../middleware/auth');
-const upload = require('../middleware/upload');
+const upload    = require('../middleware/upload');
 const asyncHandler = require('../utils/asyncHandler');
+<<<<<<< Updated upstream
 const {
     uploadOnCloudinary,
     deleteFromeCloudinary
 } = require("../service/cloudinary.service");
+=======
+const { isValidPhone, PHONE_ERROR } = require('../utils/phoneValidator');
+>>>>>>> Stashed changes
 
 router.use(protect);
 
-const EDITABLE = ['name', 'rollNo', 'phone', 'department', 'degree', 'passingYear', 'cgpa', 'percentage', 'tenthPercentage', 'twelfthPercentage', 'backlogs'];
-const NUMERIC = ['passingYear', 'cgpa', 'percentage', 'tenthPercentage', 'twelfthPercentage', 'backlogs'];
+const EDITABLE = ['name', 'rollNumber', 'phone', 'department', 'degree', 'passingYear', 'cgpa', 'percentage', 'tenthPercentage', 'twelfthPercentage', 'backlogs'];
+const NUMERIC  = ['passingYear', 'cgpa', 'percentage', 'tenthPercentage', 'twelfthPercentage', 'backlogs'];
 
-// ---------- Student: own profile ----------
+// ── Student: view own profile ────────────────────────────────────
 router.get('/me', authorize('student'), asyncHandler(async (req, res) => {
   const student = await Student.findOne({ user: req.user._id }).populate('user', 'email');
   if (!student) return res.status(404).json({ message: 'Profile not found' });
   res.json(student);
 }));
+<<<<<<< Updated upstream
 // update profile
+=======
+
+// ── Student: update own profile ──────────────────────────────────
+>>>>>>> Stashed changes
 router.put('/me', authorize('student'), asyncHandler(async (req, res) => {
   const student = await Student.findOne({ user: req.user._id });
   if (!student) return res.status(404).json({ message: 'Profile not found' });
+
+  // Phone validation
+  if (req.body.phone !== undefined && req.body.phone !== '') {
+    if (!isValidPhone(req.body.phone)) {
+      return res.status(400).json({ message: PHONE_ERROR });
+    }
+  }
+
   for (const f of EDITABLE) {
     if (req.body[f] === undefined) continue;
     const v = req.body[f];
@@ -39,6 +56,7 @@ router.put('/me', authorize('student'), asyncHandler(async (req, res) => {
   res.json(student);
 }));
 
+<<<<<<< Updated upstream
 // upload and update resume both are happend
 
 router.post(
@@ -133,18 +151,31 @@ router.post(
 );
 // ---------- Admin: manage students ----------
 // Search + filters: ?search=&department=&passingYear=&minCgpa=&placementStatus=&page=&limit=
+=======
+// ── Student: upload resume ────────────────────────────────────────
+router.post('/me/resume', authorize('student'), upload.single('resume'), asyncHandler(async (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'Please attach a PDF file' });
+  const student = await Student.findOne({ user: req.user._id });
+  if (student.resume) fs.unlink(path.join(__dirname, '..', student.resume), () => {});
+  student.resume = `/uploads/resumes/${req.file.filename}`;
+  await student.save();
+  res.json(student);
+}));
+
+// ── Admin: list students ──────────────────────────────────────────
+>>>>>>> Stashed changes
 router.get('/', authorize('admin'), asyncHandler(async (req, res) => {
   const { search, department, passingYear, minCgpa, placementStatus } = req.query;
-  const page = Math.max(parseInt(req.query.page) || 1, 1);
+  const page  = Math.max(parseInt(req.query.page)  || 1, 1);
   const limit = Math.min(parseInt(req.query.limit) || 20, 100);
   const q = {};
   if (search) {
     const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-    q.$or = [{ name: rx }, { rollNo: rx }];
+    q.$or = [{ name: rx }, { rollNumber: rx }];
   }
-  if (department) q.department = new RegExp(`^${department.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
-  if (passingYear) q.passingYear = Number(passingYear);
-  if (minCgpa) q.cgpa = { $gte: Number(minCgpa) };
+  if (department)      q.department = new RegExp(`^${department.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
+  if (passingYear)     q.passingYear = Number(passingYear);
+  if (minCgpa)         q.cgpa = { $gte: Number(minCgpa) };
   if (placementStatus) q.placementStatus = placementStatus;
 
   const [students, total] = await Promise.all([

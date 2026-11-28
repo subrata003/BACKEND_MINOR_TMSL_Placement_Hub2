@@ -8,7 +8,6 @@ const jobSchema = new mongoose.Schema(
     jobType: { type: String, enum: ['Full-time', 'Internship', 'Internship + PPO'], default: 'Full-time' },
     location: String,
     package: { type: Number, min: 0 }, // LPA
-    // Every job must define eligibility criteria and an application deadline
     eligibility: {
       minCgpa: { type: Number, default: 0 },
       minPercentage: { type: Number, default: 0 },
@@ -18,7 +17,12 @@ const jobSchema = new mongoose.Schema(
       passingYear: Number,
     },
     deadline: { type: Date, required: [true, 'Application deadline is required'] },
-    status: { type: String, enum: ['Open', 'Closed'], default: 'Open' },
+    // 'Open' = accepting applications, 'Closed' = manually closed, 'Expired' = deadline passed
+    status: { type: String, enum: ['Open', 'Closed', 'Expired'], default: 'Open' },
+    // Final result lock — prevents further round processing once results declared
+    resultDeclared: { type: Boolean, default: false },
+    resultDeclaredAt: Date,
+    resultDeclaredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   },
   { timestamps: true }
 );
